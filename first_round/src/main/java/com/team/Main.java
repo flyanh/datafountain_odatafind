@@ -14,7 +14,10 @@ import java.util.stream.Collectors;
 @SuppressWarnings("all")
 public class Main {
 
-    /* true: 线下; false: 线上; */
+    /**
+     * true: 线下;
+     * false: 线上;
+     */
     public static final boolean LOCAL = true;
 //    public static final boolean LOCAL = false;
 

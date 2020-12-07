@@ -18,14 +18,14 @@ public class TableImpl implements Table {
 
     private final List<Partition> partitions;
 
-    private final int levelPartitions;
+    private final PartitionIndex partitionIndex;
 
     public TableImpl(File tableDirFile) {
         this.tableDirFile = tableDirFile;
         /* 加载表中所有的分区，如果有的话 */
         partitions = loadPartitions(tableDirFile);
-        /* 探测分区级别 */
-        levelPartitions = computeLevelPartitions(partitions);
+        /* 加载分区索引。 */
+        partitionIndex = new PartitionIndex(partitions);
     }
 
     public File getTableDirFile() {
@@ -37,7 +37,11 @@ public class TableImpl implements Table {
     }
 
     public int getLevelPartitions() {
-        return levelPartitions;
+        return partitionIndex.getLevelPartitions();
+    }
+
+    public PartitionIndex getPartitionTreeIndex() {
+        return partitionIndex;
     }
 
     /**
@@ -52,7 +56,7 @@ public class TableImpl implements Table {
     public String toString() {
         return "====================================================================" + "\n" +
                 "Table Name: " + this.tableName() + "\n" +
-                "Level of Partitions: " + levelPartitions + "\n" +
+                "Level of Partitions: " + getLevelPartitions() + "\n" +
                 "Number of Partitions: " + partitions.size() + "\n" +
                 "Partitions: " + partitions +
                 "\n====================================================================" + "\n\n";
@@ -76,7 +80,7 @@ public class TableImpl implements Table {
         boolean isCmpCol = cmpColString.contains("column");
         boolean isLikeCol = likeColString.contains("column");
 
-        if(levelPartitions == 0) {              /* 无分区表 */
+        if(getLevelPartitions() == 0) {              /* 无分区表 */
             File[] dataFiles;
             if( (dataFiles = tableDirFile.listFiles()) == null ) {
                 return 0;
@@ -205,44 +209,32 @@ public class TableImpl implements Table {
                 int likeCol = likeColString.charAt(likeColString.length() - 1) - '0';
 
                 /* 通过比较参数完成初步数据筛选。 */
-                Queue<Partition> Q = new LinkedList<>(partitions);
-                List<String> data = new ArrayList<>(1024);
-                while (!Q.isEmpty()) {
-                    int size = Q.size();
-                    for (int i = 0; i < size; i++) {
-                        Partition partition = Objects.requireNonNull(Q.poll());
-                        if( !partition.getPartitionName().equals(cmpColString) ) {  /* 如果不是我们需要的分区，则继续往下遍历。 */
-                            if(partition.hasSubpartitions()) {
-                                Q.addAll(partition.getSubpartitions());
+                List<Partition> initPartitions = partitionIndex.getDepthPartitions(cmpColString);
+                List<String> data = new ArrayList<>(initPartitions.size() * 1024);
+                for (Partition partition : initPartitions) {
+                    /* 比较当前分区的值是否匹配，匹配则将当前分区的所有数据加载。 */
+                    String checkValue = partition.getValue();
+                    switch (cmpType) {
+                        case equals:
+                            if (checkValue.equals(cmpValue)) {
+                                loadPartitionData(partition, likeCol, data);
                             }
-                            continue;
-                        }
-
-                        /* 比较当前分区的值是否匹配，匹配则将当前分区的所有数据加载。 */
-                        String checkValue = partition.getValue();
-                        switch (cmpType) {
-                            case equals:
-                                if (checkValue.equals(cmpValue)) {
-                                    loadPartitionData(partition, likeCol, data);
-                                }
-                                break;
-                            case notEquals:
-                                if (!checkValue.equals(cmpValue)) {
-                                    loadPartitionData(partition, likeCol, data);
-                                }
-                                break;
-                            case greater:
-                                if (checkValue.compareTo(cmpValue) > 0) {
-                                    loadPartitionData(partition, likeCol, data);
-                                }
-                                break;
-                            case less:
-                                if (checkValue.compareTo(cmpValue) < 0) {
-                                    loadPartitionData(partition, likeCol, data);
-                                }
-                                break;
-                        }
-
+                            break;
+                        case notEquals:
+                            if (!checkValue.equals(cmpValue)) {
+                                loadPartitionData(partition, likeCol, data);
+                            }
+                            break;
+                        case greater:
+                            if (checkValue.compareTo(cmpValue) > 0) {
+                                loadPartitionData(partition, likeCol, data);
+                            }
+                            break;
+                        case less:
+                            if (checkValue.compareTo(cmpValue) < 0) {
+                                loadPartitionData(partition, likeCol, data);
+                            }
+                            break;
                     }
                 }
 
@@ -259,52 +251,41 @@ public class TableImpl implements Table {
                 int cmpCol = cmpColString.charAt(cmpColString.length() - 1) - '0';
 
                 /* 通过比较参数完成初步数据筛选。 */
+                List<Partition> initPartitions = partitionIndex.getDepthPartitions(likeColString);
                 int matchedCount = 0;
-                Queue<Partition> Q = new LinkedList<>(partitions);
-                while (!Q.isEmpty()) {
-                    int size = Q.size();
-                    for (int i = 0; i < size; i++) {
-                        Partition partition = Objects.requireNonNull(Q.poll());
-                        if( !partition.getPartitionName().equals(likeColString) ) {  /* 如果不是我们需要的分区，则继续往下遍历。 */
-                            if(partition.hasSubpartitions()) {
-                                Q.addAll(partition.getSubpartitions());
-                            }
-                            continue;
-                        }
+                for (Partition partition : initPartitions) {
+                    /* 比较 like 参数。 */
+                    if(!like(partition.getValue(), likeType, patterns)) {
+                        continue;
+                    }
 
-                        /* 比较 like 参数。 */
-                        if(!like(partition.getValue(), likeType, patterns)) {
-                            continue;
-                        }
+                    /* 加载该分区的所有数据。 */
+                    List<String> data = new ArrayList<>(1024);
+                    loadPartitionData(partition, cmpCol, data);
 
-                        /* 加载该分区的所有数据。 */
-                        List<String> data = new ArrayList<>(1024);
-                        loadPartitionData(partition, cmpCol, data);
-
-                        /* 通过比较参数进行第最终筛选。 */
-                        for (String checkValue : data) {
-                            switch (cmpType) {
-                                case equals:
-                                    if(checkValue.equals(cmpValue)) {
-                                        ++matchedCount;
-                                    }
-                                    break;
-                                case notEquals:
-                                    if(!checkValue.equals(cmpValue)) {
-                                        ++matchedCount;
-                                    }
-                                    break;
-                                case greater:
-                                    if(checkValue.compareTo(cmpValue) > 0) {
-                                        ++matchedCount;
-                                    }
-                                    break;
-                                case less:
-                                    if(checkValue.compareTo(cmpValue) < 0) {
-                                        ++matchedCount;
-                                    }
-                                    break;
-                            }
+                    /* 通过比较参数进行第最终筛选。 */
+                    for (String checkValue : data) {
+                        switch (cmpType) {
+                            case equals:
+                                if(checkValue.equals(cmpValue)) {
+                                    ++matchedCount;
+                                }
+                                break;
+                            case notEquals:
+                                if(!checkValue.equals(cmpValue)) {
+                                    ++matchedCount;
+                                }
+                                break;
+                            case greater:
+                                if(checkValue.compareTo(cmpValue) > 0) {
+                                    ++matchedCount;
+                                }
+                                break;
+                            case less:
+                                if(checkValue.compareTo(cmpValue) < 0) {
+                                    ++matchedCount;
+                                }
+                                break;
                         }
                     }
                 }
@@ -342,8 +323,7 @@ public class TableImpl implements Table {
                         BufferedReader reader = new BufferedReader(new FileReader(file));
                         String line;
                         while ((line = reader.readLine()) != null) {
-                            String[] split = line.split("\\|");
-                            data.add(split[likeCol]);
+                            data.add(line.split("\\|")[likeCol]);
                         }
                         reader.close();
                     } catch (IOException e) {
@@ -395,20 +375,5 @@ public class TableImpl implements Table {
 
         return partitions;
     }
-
-    /**
-     * 获取当前表的分区等级。
-     *  - == 0：无分区表
-     *  - >  0：多级分区表
-     */
-    private
-    int computeLevelPartitions(List<Partition> partitions) {
-        if(partitions.isEmpty()) {
-            return 0;
-        }
-
-        return computeLevelPartitions(partitions.get(0).getSubpartitions()) + 1;
-    }
-
 
 }
